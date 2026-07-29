@@ -16,7 +16,8 @@ Scripts and building from source (this fork)
 This fork adds PowerShell scripts for building, installing, signing, and diagnosing the driver. All scripts live in **Scripts/**. Run them from the repo root, e.g. `.\Scripts\build.ps1`.
 
 **Build and install**
-- **Scripts\build.ps1** — Build driver, Ext2Srv, Ext2Mgr (requires Visual Studio 2019/2022 and WDK). Optionally signs the driver if `EXT4FSD_CERT_PATH` is set.
+- **Scripts\build.ps1** — Build driver, Ext2Srv, and/or Ext2Mgr (Visual Studio 2019/2022). Default `-Target All` needs WDK. Use `-Target Ext2Mgr` or `-Target Ext2Srv` for user-mode only (no WDK). Optionally signs the driver if `EXT4FSD_CERT_PATH` is set. Cursor/VS Code: `.vscode/tasks.json` + `launch.json`.
+- **Scripts\release_usermode.ps1** — Package Ext2Srv + `ext2mgr_iced` user-mode zips (no driver / no WDK). Default: **host architecture only**. Pass `-Platforms x64,ARM64` for both (requires ARM64 MSVC tools). Writes `dist\usermode-<version>\` with `RELEASE_NOTES.txt` and SHA256 sums.
 - **Scripts\install_driver.ps1** — Copy driver to System32, register kernel driver, install Ext2Srv. Run as Administrator.
 - **Scripts\uninstall_driver.ps1** — Remove driver and services.
 - **Scripts\register_driver.ps1** — Register the kernel driver service (driver must already be in System32).
