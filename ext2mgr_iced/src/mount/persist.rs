@@ -48,6 +48,22 @@ pub fn clear_registry_mount_point(letter: char) -> Result<(), String> {
     }
 }
 
+/// Drop Session Manager letters that target `\Device\HarddiskN\PartitionM`
+/// (invalid Ext2Fsd mount targets left by a prior iced bug). Real mounts use
+/// `\Device\HarddiskVolumeN`.
+pub fn scrub_partition_path_session_letters() -> Vec<char> {
+    let mut removed = Vec::new();
+    for (letter, device) in registry_dos_device_entries() {
+        let upper = device.to_ascii_uppercase();
+        if upper.contains(r"\PARTITION") && !upper.contains(r"\HARDDISKVOLUME") {
+            if clear_registry_mount_point(letter).is_ok() {
+                removed.push(letter);
+            }
+        }
+    }
+    removed
+}
+
 /// Drive-letter Session Manager DOS Devices entries (`X:` → `\Device\…`).
 pub fn registry_dos_device_entries() -> Vec<(char, String)> {
     let Ok(key) = open_key(DOS_DEVICES_KEY, false) else {
@@ -105,6 +121,15 @@ pub fn registry_dos_device_entries() -> Vec<(char, String)> {
     entries
 }
 
+/// Target device for a Session Manager letter (`X:` → `\Device\…`), if any.
+pub fn registry_device_for_letter(letter: char) -> Option<String> {
+    let want = letter.to_ascii_uppercase();
+    registry_dos_device_entries()
+        .into_iter()
+        .find(|(entry, _)| *entry == want)
+        .map(|(_, device)| device)
+}
+
 /// All Session Manager DOS Devices letters that map to `device_nt_path`.
 pub fn registry_letters_for_device(device_nt_path: &str) -> Vec<char> {
     let mut letters: Vec<char> = registry_dos_device_entries()
@@ -141,6 +166,23 @@ pub fn store_ext2_automount(
     let result = set_string(key, &value_name, &data);
     close_key(key);
     result
+}
+
+/// Remove Ext2Fsd `Volumes\{UUID}` so refresh/automount does not immediately
+/// rebind a letter the user just removed from Mount Points.
+pub fn clear_ext2_automount_mount_point(uuid: &[u8; 16]) -> Result<(), String> {
+    let key = open_key(VOLUMES_KEY, true)?;
+    let value_name = format_volume_uuid(uuid);
+    let wide = to_wide(&value_name);
+    let status = unsafe {
+        windows_sys::Win32::System::Registry::RegDeleteValueW(key, wide.as_ptr())
+    };
+    close_key(key);
+    if status == 0 || status == 2 {
+        Ok(())
+    } else {
+        Err(format!("RegDeleteValue({value_name}) failed ({status})"))
+    }
 }
 
 /// Preferred drive letter from Ext2Fsd `Volumes\{UUID}` (`MountPoint=X:`), if any.

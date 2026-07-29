@@ -626,7 +626,15 @@ impl Ext2MgrApp {
                 err_message,
                 is_error,
                 restore_mount_points,
+                explorer_notify,
+                run_automount,
             } => {
+                #[cfg(windows)]
+                {
+                    for (letter, arrival) in explorer_notify {
+                        crate::mount::ops::notify_explorer_letter(letter, arrival);
+                    }
+                }
                 if let Some(err) = err_message {
                     if is_error {
                         self.report_error(err);
@@ -654,16 +662,18 @@ impl Ext2MgrApp {
                                 new_volume_index = Some(found);
                             }
                         }
-                        let letters = if let Some(index) = new_volume_index {
-                            self.volumes
-                                .get(index)
-                                .map(|volume| volume.letters.clone())
-                                .unwrap_or_default()
-                        } else if let Some((disk, part)) = disk_part {
+                        // Prefer disk/partition identity so we don't jump to another
+                        // volume after reload reorders the volume list.
+                        let letters = if let Some((disk, part)) = disk_part {
                             self.disks
                                 .get(disk)
                                 .and_then(|entry| entry.partitions.get(part))
                                 .map(|partition| partition.letters.clone())
+                                .unwrap_or_default()
+                        } else if let Some(index) = new_volume_index {
+                            self.volumes
+                                .get(index)
+                                .map(|volume| volume.letters.clone())
                                 .unwrap_or_default()
                         } else {
                             Vec::new()
@@ -684,12 +694,40 @@ impl Ext2MgrApp {
                             selected,
                         });
                     }
-                    return self.automount_task();
+                    if run_automount {
+                        return self.automount_task();
+                    }
                 }
             }
             Message::AutomountFinished(report) => {
                 if report.did_mount() {
+                    let dialog = self.dialog.clone();
                     self.reload_lists();
+                    // Keep Mount Points on the same disk/partition / uuid after
+                    // volume list reorder from remounts.
+                    if let Some(Dialog::MountPoints {
+                        volume_index,
+                        disk_part,
+                        selected,
+                    }) = dialog
+                    {
+                        let mut new_volume_index = volume_index;
+                        if let Some((disk, part)) = disk_part {
+                            if let Some(index) = self
+                                .disks
+                                .get(disk)
+                                .and_then(|entry| entry.partitions.get(part))
+                                .and_then(|partition| partition.volume_index)
+                            {
+                                new_volume_index = Some(index);
+                            }
+                        }
+                        self.dialog = Some(Dialog::MountPoints {
+                            volume_index: new_volume_index,
+                            disk_part,
+                            selected,
+                        });
+                    }
                 }
                 if let Some(summary) = report.summary() {
                     self.status = summary;
@@ -698,100 +736,137 @@ impl Ext2MgrApp {
             Message::RemoveLetter(letter) => {
                 #[cfg(windows)]
                 {
-                    let (symlink, restore) = match &self.dialog {
+                    // Never call DeleteVolumeMountPoint / pipe unmount on the UI thread —
+                    // Ext2 DOS-only letters hang on `X:\` and MessageBox then chimes.
+                    let (symlink, win32, uuid, restore) = match &self.dialog {
                         Some(Dialog::MountPoints {
                             volume_index,
                             disk_part,
-                            selected,
+                            ..
                         }) => {
-                            let symlink = if let Some(index) = volume_index {
-                                self.volumes
-                                    .get(*index)
-                                    .map(|volume| volume.symlink.clone())
-                                    .unwrap_or_default()
+                            let (symlink, win32, uuid) = if let Some(index) = volume_index {
+                                self.volumes.get(*index).map_or_else(
+                                    || (String::new(), String::new(), None),
+                                    |volume| {
+                                        (
+                                            crate::mount::ops::dos_device_target(
+                                                &volume.physical_object,
+                                                &volume.symlink,
+                                            ),
+                                            volume.win32_volume_name.clone(),
+                                            volume.uuid,
+                                        )
+                                    },
+                                )
                             } else if let Some((disk, part)) = disk_part {
                                 self.disks
                                     .get(*disk)
                                     .and_then(|entry| entry.partitions.get(*part))
-                                    .map(|partition| partition.symlink.clone())
-                                    .unwrap_or_default()
+                                    .map_or_else(
+                                        || (String::new(), String::new(), None),
+                                        |partition| {
+                                            let linked = partition
+                                                .volume_index
+                                                .and_then(|index| self.volumes.get(index));
+                                            let uuid = linked.and_then(|volume| volume.uuid);
+                                            let physical = linked
+                                                .map(|volume| volume.physical_object.as_str())
+                                                .unwrap_or("");
+                                            let volume_symlink = linked
+                                                .map(|volume| volume.symlink.as_str())
+                                                .unwrap_or(partition.symlink.as_str());
+                                            (
+                                                crate::mount::ops::dos_device_target(
+                                                    physical,
+                                                    volume_symlink,
+                                                ),
+                                                linked
+                                                    .map(|volume| volume.win32_volume_name.clone())
+                                                    .unwrap_or_else(|| {
+                                                        partition.win32_volume_name.clone()
+                                                    }),
+                                                uuid,
+                                            )
+                                        },
+                                    )
                             } else {
-                                String::new()
+                                (String::new(), String::new(), None)
                             };
                             (
                                 symlink,
-                                Some((
-                                    *volume_index,
-                                    *disk_part,
-                                    *selected,
-                                    self.volumes
-                                        .get(volume_index.unwrap_or(usize::MAX))
-                                        .map(|volume| {
-                                            (
-                                                volume.win32_volume_name.clone(),
-                                                volume.uuid,
-                                                volume.physical_object.clone(),
-                                            )
-                                        }),
-                                )),
+                                win32.clone(),
+                                uuid,
+                                Some((*volume_index, *disk_part, letter, win32, uuid)),
                             )
                         }
                         _ => {
-                            let symlink = self
+                            let (symlink, win32, uuid) = self
                                 .selected_volume_index()
                                 .and_then(|index| self.volumes.get(index))
-                                .map(|volume| volume.symlink.clone())
-                                .unwrap_or_default();
-                            (symlink, None)
+                                .map(|volume| {
+                                    (
+                                        crate::mount::ops::dos_device_target(
+                                            &volume.physical_object,
+                                            &volume.symlink,
+                                        ),
+                                        volume.win32_volume_name.clone(),
+                                        volume.uuid,
+                                    )
+                                })
+                                .unwrap_or_else(|| (String::new(), String::new(), None));
+                            (symlink, win32, uuid, None)
                         }
                     };
-                    match crate::mount::ops::unmount_letter(letter, &symlink) {
-                        Ok(()) => {
-                            self.status = format!("Removed {letter}:");
-                            self.reload_lists();
-                            if let Some((volume_index, disk_part, _selected, mounted_volume)) =
-                                restore
-                            {
-                                let mut new_volume_index = volume_index;
-                                if let Some((win32_name, uuid, physical)) = mounted_volume {
-                                    if let Some(found) = self.volumes.iter().position(|volume| {
-                                        volume.win32_volume_name == win32_name
-                                            || (uuid.is_some() && volume.uuid == uuid)
-                                            || (!physical.is_empty()
-                                                && volume.physical_object == physical)
-                                    }) {
-                                        new_volume_index = Some(found);
-                                    }
+                    self.status = format!("Removing {letter}:…");
+                    self.dialog = None;
+                    return Task::perform(
+                        async move {
+                            let result = tokio::task::spawn_blocking(move || {
+                                crate::mount::ops::unmount_letter_ex(
+                                    letter, &symlink, &win32, uuid,
+                                )
+                            })
+                            .await;
+                            match result {
+                                Ok(Ok(())) => (
+                                    Some(format!("Removed {letter}:")),
+                                    None,
+                                    false,
+                                    restore,
+                                    vec![(letter, false)],
+                                    false,
+                                ),
+                                Ok(Err(err)) => {
+                                    (None, Some(err), false, None, Vec::new(), false)
                                 }
-                                let letters = if let Some(index) = new_volume_index {
-                                    self.volumes
-                                        .get(index)
-                                        .map(|volume| volume.letters.clone())
-                                        .unwrap_or_default()
-                                } else if let Some((disk, part)) = disk_part {
-                                    self.disks
-                                        .get(disk)
-                                        .and_then(|entry| entry.partitions.get(part))
-                                        .map(|partition| partition.letters.clone())
-                                        .unwrap_or_default()
-                                } else {
-                                    Vec::new()
-                                };
-                                let selected = if letters.is_empty() {
-                                    None
-                                } else {
-                                    Some(0)
-                                };
-                                self.dialog = Some(Dialog::MountPoints {
-                                    volume_index: new_volume_index,
-                                    disk_part,
-                                    selected,
-                                });
+                                Err(join_err) => (
+                                    None,
+                                    Some(join_err.to_string()),
+                                    true,
+                                    None,
+                                    Vec::new(),
+                                    false,
+                                ),
                             }
-                            return self.automount_task();
-                        }
-                        Err(err) => self.report_warning(err),
-                    }
+                        },
+                        |(
+                            ok_message,
+                            err_message,
+                            is_error,
+                            restore_mount_points,
+                            explorer_notify,
+                            run_automount,
+                        )| {
+                            Message::PipeOpFinished {
+                                ok_message,
+                                err_message,
+                                is_error,
+                                restore_mount_points,
+                                explorer_notify,
+                                run_automount,
+                            }
+                        },
+                    );
                 }
                 #[cfg(not(windows))]
                 {

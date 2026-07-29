@@ -545,7 +545,7 @@ impl Ext2MgrApp {
                 disk_part,
                 selected,
             }) => {
-                let (mut letters, win32_name, device_path) = {
+                let (mut letters, win32_name, device_path, mount_uuid) = {
                     if let Some(index) = *volume_index {
                         self.volumes
                             .get(index)
@@ -553,11 +553,11 @@ impl Ext2MgrApp {
                                 (
                                     volume.letters.clone(),
                                     volume.win32_volume_name.clone(),
-                                    if volume.physical_object.is_empty() {
-                                        volume.symlink.clone()
-                                    } else {
-                                        volume.physical_object.clone()
-                                    },
+                                    crate::mount::ops::dos_device_target(
+                                        &volume.physical_object,
+                                        &volume.symlink,
+                                    ),
+                                    volume.uuid,
                                 )
                             })
                             .unwrap_or_default()
@@ -566,15 +566,30 @@ impl Ext2MgrApp {
                             .get(disk)
                             .and_then(|entry| entry.partitions.get(part))
                             .map(|partition| {
+                                let linked = partition
+                                    .volume_index
+                                    .and_then(|index| self.volumes.get(index));
+                                let physical = linked
+                                    .map(|volume| volume.physical_object.as_str())
+                                    .unwrap_or("");
+                                let volume_symlink = linked
+                                    .map(|volume| volume.symlink.as_str())
+                                    .unwrap_or(partition.symlink.as_str());
                                 (
                                     partition.letters.clone(),
-                                    partition.win32_volume_name.clone(),
-                                    partition.symlink.clone(),
+                                    linked
+                                        .map(|volume| volume.win32_volume_name.clone())
+                                        .unwrap_or_else(|| partition.win32_volume_name.clone()),
+                                    crate::mount::ops::dos_device_target(
+                                        physical,
+                                        volume_symlink,
+                                    ),
+                                    linked.and_then(|volume| volume.uuid),
                                 )
                             })
                             .unwrap_or_default()
                     } else {
-                        (Vec::new(), String::new(), String::new())
+                        (Vec::new(), String::new(), String::new(), None)
                     }
                 };
                 // Include dormant Session Manager letters (registry only, not live DOS yet).
@@ -600,6 +615,7 @@ impl Ext2MgrApp {
                                     *letter,
                                     &win32_name,
                                     &device_path,
+                                    mount_uuid,
                                 );
                                 let row_button = if selected_index == Some(index) {
                                     button(text(label))

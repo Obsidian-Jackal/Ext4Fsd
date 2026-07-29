@@ -170,6 +170,11 @@ pub enum Message {
         is_error: bool,
         /// Re-open Change Drive Letters after a successful Assign from that dialog.
         restore_mount_points: Option<(Option<usize>, Option<(usize, usize)>, char, String, Option<[u8; 16]>)>,
+        /// Explorer shell notify on the UI thread: `(letter, arrival)`.
+        explorer_notify: Vec<(char, bool)>,
+        /// When false (Mount Points Remove), skip startup automount so removed
+        /// letters are not immediately rebound onto this or another volume.
+        run_automount: bool,
     },
     /// Ext2Mgr `Ext2ProcessExt2Volumes` finished (after load/refresh).
     AutomountFinished(crate::mount::ops::AutomountReport),

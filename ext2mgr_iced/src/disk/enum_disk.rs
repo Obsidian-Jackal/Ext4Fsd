@@ -94,9 +94,19 @@ mod win_impl {
     }
 
     pub fn enumerate_all() -> (Vec<DiskEntry>, Vec<VolumeEntry>, Vec<DiskRow>) {
-        let volumes = enumerate_volumes();
+        let mut volumes = enumerate_volumes();
         let mut disks = enumerate_disks();
         link_partitions_to_volumes(&mut disks, &volumes);
+        // Ext2 DefineDosDevice volumes vanish from FindFirstVolume when unlettered.
+        // Probe the partition on-disk so FS type / UUID survive Remove-all-letters.
+        fill_missing_partition_filesystems(&mut disks);
+        let before = volumes.len();
+        append_volumes_for_unlinked_ext_partitions(&disks, &mut volumes);
+        if volumes.len() != before {
+            // Synthesized rows are appended; re-sort so Volume7 does not sink to bottom.
+            sort_volumes_by_harddisk_number(&mut volumes);
+            link_partitions_to_volumes(&mut disks, &volumes);
+        }
         let rows = build_disk_rows(&disks);
         (disks, volumes, rows)
     }
@@ -336,11 +346,13 @@ mod win_impl {
         // point, so FindFirstVolume never saw them. Synthesize those orphans.
         synthesize_volumes_for_orphan_letters(&mut volumes);
         for volume in volumes.iter_mut() {
-            if !volume.letters.is_empty() {
-                let probe_name = if volume.win32_volume_name.is_empty() {
-                    format!(r"\\.\{}:", volume.letters[0])
-                } else {
+            // Letter-less Win32 volumes must still keep FS (after Remove all letters).
+            let can_probe = !volume.letters.is_empty() || !volume.win32_volume_name.is_empty();
+            if can_probe {
+                let probe_name = if !volume.win32_volume_name.is_empty() {
                     volume.win32_volume_name.clone()
+                } else {
+                    format!(r"\\.\{}:", volume.letters[0])
                 };
                 let (filesystem, total_bytes, used_bytes, uuid) =
                     detect_filesystem_and_sizes(&probe_name, &volume.letters);
@@ -368,13 +380,38 @@ mod win_impl {
             volume.codepage = resolve_volume_codepage(volume);
         }
 
+        sort_volumes_by_harddisk_number(&mut volumes);
+        volumes
+    }
+
+    fn sort_volumes_by_harddisk_number(volumes: &mut [VolumeEntry]) {
         volumes.sort_by(|left, right| {
-            left.letters
-                .first()
-                .cmp(&right.letters.first())
+            harddisk_volume_number(&left.physical_object)
+                .or_else(|| harddisk_volume_number(&left.symlink))
+                .cmp(
+                    &harddisk_volume_number(&right.physical_object)
+                        .or_else(|| harddisk_volume_number(&right.symlink)),
+                )
+                .then_with(|| left.letters.first().cmp(&right.letters.first()))
                 .then_with(|| left.symlink.cmp(&right.symlink))
         });
-        volumes
+    }
+
+    /// Parse N from `\Device\HarddiskVolumeN` as an integer.
+    /// String compare would order Volume10 before Volume6.
+    fn harddisk_volume_number(path: &str) -> Option<u32> {
+        let upper = path.to_ascii_uppercase();
+        let marker = "HARDDISKVOLUME";
+        let start = upper.find(marker)? + marker.len();
+        let digits: String = upper[start..]
+            .chars()
+            .take_while(|ch| ch.is_ascii_digit())
+            .collect();
+        if digits.is_empty() {
+            None
+        } else {
+            digits.parse().ok()
+        }
     }
 
     fn enumerate_disks() -> Vec<DiskEntry> {
@@ -735,6 +772,189 @@ mod win_impl {
                         break;
                     }
                 }
+            }
+        }
+    }
+
+    /// Open PhysicalDrive with read access (layout IOCTLs may use access=0).
+    fn open_physical_drive_readable(
+        disk_index: u32,
+    ) -> Option<windows_sys::Win32::Foundation::HANDLE> {
+        let path = format!(r"\\.\PhysicalDrive{disk_index}");
+        let wide = to_wide(&path);
+        const GENERIC_READ: u32 = 0x8000_0000;
+        let handle = unsafe {
+            windows_sys::Win32::Storage::FileSystem::CreateFileW(
+                wide.as_ptr(),
+                GENERIC_READ,
+                windows_sys::Win32::Storage::FileSystem::FILE_SHARE_READ
+                    | windows_sys::Win32::Storage::FileSystem::FILE_SHARE_WRITE,
+                std::ptr::null(),
+                windows_sys::Win32::Storage::FileSystem::OPEN_EXISTING,
+                0,
+                0,
+            )
+        };
+        if handle == windows_sys::Win32::Foundation::INVALID_HANDLE_VALUE {
+            None
+        } else {
+            Some(handle)
+        }
+    }
+
+    fn probe_filesystem_at_disk_offset(
+        disk_index: u32,
+        starting_offset: u64,
+    ) -> Option<(String, Option<[u8; 16]>)> {
+        let handle = open_physical_drive_readable(disk_index)?;
+        let mut first = vec![0u8; 4096];
+        let ok = read_at(handle, starting_offset, &mut first);
+        if !ok {
+            unsafe {
+                windows_sys::Win32::Foundation::CloseHandle(handle);
+            }
+            return None;
+        }
+        if let Some(result) = crate::disk::fs_probe::probe_first_page(&first) {
+            unsafe {
+                windows_sys::Win32::Foundation::CloseHandle(handle);
+            }
+            return Some(result);
+        }
+        let mut btrfs = vec![0u8; 4096];
+        if read_at(handle, starting_offset + BTRFS_SUPER_BLOCK_OFFSET, &mut btrfs) {
+            if let Some(name) = crate::disk::fs_probe::probe_btrfs_page(&btrfs) {
+                unsafe {
+                    windows_sys::Win32::Foundation::CloseHandle(handle);
+                }
+                return Some((name, None));
+            }
+        }
+        let mut raid = vec![0u8; 4096];
+        if read_at(handle, starting_offset + RAID_SUPER_BLOCK_OFFSET, &mut raid) {
+            if let Some(name) = crate::disk::fs_probe::probe_raid_page(&raid) {
+                unsafe {
+                    windows_sys::Win32::Foundation::CloseHandle(handle);
+                }
+                return Some((name, None));
+            }
+        }
+        unsafe {
+            windows_sys::Win32::Foundation::CloseHandle(handle);
+        }
+        None
+    }
+
+    fn fill_missing_partition_filesystems(disks: &mut [DiskEntry]) {
+        for disk in disks.iter_mut() {
+            for partition in disk.partitions.iter_mut() {
+                if !partition.filesystem.is_empty()
+                    && !partition.filesystem.eq_ignore_ascii_case("RAW")
+                {
+                    continue;
+                }
+                let Some((filesystem, uuid)) =
+                    probe_filesystem_at_disk_offset(disk.index, partition.starting_offset)
+                else {
+                    continue;
+                };
+                partition.filesystem = filesystem;
+                if let Some(harddisk_volume) = find_harddisk_volume_for_extent(
+                    disk.index,
+                    partition.starting_offset,
+                    partition.length,
+                ) {
+                    partition.symlink = harddisk_volume;
+                } else if partition.symlink.is_empty() {
+                    // Display-only fallback — never use for DefineDosDevice / Session Manager.
+                    partition.symlink = format!(
+                        r"\Device\Harddisk{}\Partition{}",
+                        disk.index, partition.number
+                    );
+                }
+                let _ = uuid; // applied when synthesizing the volume row
+            }
+        }
+    }
+
+    /// Map a partition extent to `\Device\HarddiskVolumeN` (required by Ext2Fsd /
+    /// Ext2Mgr for DefineDosDevice and Session Manager). Never invent
+    /// `HarddiskN\PartitionM` as a mount target — those "succeed" in registry and
+    /// leave Explorer-dead letters.
+    fn find_harddisk_volume_for_extent(
+        disk_number: u32,
+        starting_offset: u64,
+        extent_length: u64,
+    ) -> Option<String> {
+        for index in 1u32..128 {
+            let open = format!(r"\\?\GLOBALROOT\Device\HarddiskVolume{index}");
+            let Some(extents) = volume_extents_from_path(&open) else {
+                continue;
+            };
+            if extents.iter().any(|extent| {
+                extent.disk_number == disk_number
+                    && extent.starting_offset == starting_offset
+                    && extent.extent_length == extent_length
+            }) {
+                return Some(format!(r"\Device\HarddiskVolume{index}"));
+            }
+        }
+        None
+    }
+
+    /// Restore volume rows for EXT partitions that only existed via orphan letters.
+    fn append_volumes_for_unlinked_ext_partitions(
+        disks: &[DiskEntry],
+        volumes: &mut Vec<VolumeEntry>,
+    ) {
+        for disk in disks {
+            for partition in &disk.partitions {
+                if partition.volume_index.is_some() {
+                    continue;
+                }
+                let fs_upper = partition.filesystem.to_ascii_uppercase();
+                if !(fs_upper.contains("EXT2")
+                    || fs_upper.contains("EXT3")
+                    || fs_upper.contains("EXT4"))
+                {
+                    continue;
+                }
+                let already = volumes.iter().any(|volume| {
+                    volume.extents.iter().any(|extent| {
+                        extent.disk_number == disk.index
+                            && extent.starting_offset == partition.starting_offset
+                            && extent.extent_length == partition.length
+                    })
+                });
+                if already {
+                    continue;
+                }
+                let Some(physical) = find_harddisk_volume_for_extent(
+                    disk.index,
+                    partition.starting_offset,
+                    partition.length,
+                ) else {
+                    continue;
+                };
+                let uuid = probe_filesystem_at_disk_offset(disk.index, partition.starting_offset)
+                    .and_then(|(_, uuid)| uuid);
+                volumes.push(VolumeEntry {
+                    letters: Vec::new(),
+                    volume_kind: "Basic".to_string(),
+                    filesystem: partition.filesystem.clone(),
+                    total_bytes: partition.total_bytes,
+                    used_bytes: None,
+                    codepage: partition.codepage.clone(),
+                    physical_object: physical.clone(),
+                    symlink: physical,
+                    win32_volume_name: partition.win32_volume_name.clone(),
+                    extents: vec![DiskExtent {
+                        disk_number: disk.index,
+                        starting_offset: partition.starting_offset,
+                        extent_length: partition.length,
+                    }],
+                    uuid,
+                });
             }
         }
     }
@@ -1662,6 +1882,61 @@ mod win_impl {
         } else {
             codepage
         })
+    }
+
+    /// Ext2Mgr `Ext2ProcessExt2Property` — `EVP.DrvLetter` (low 7 bits), if set.
+    pub fn query_volume_fixed_drv_letter(volume: &VolumeEntry) -> Option<char> {
+        if !ext2fsd_device_present() {
+            return None;
+        }
+        for open_path in volume_ext2_open_paths(volume) {
+            if let Some(letter) = ioctl_query_ext2_drv_letter(&open_path) {
+                return Some(letter);
+            }
+        }
+        None
+    }
+
+    fn ioctl_query_ext2_drv_letter(open_path: &str) -> Option<char> {
+        // EXT2_VOLUME_PROPERTY2: base 48 + UUID[16] + DrvLetter at offset 64.
+        const IOCTL_APP_VOLUME_PROPERTY: u32 = 0x0022_1F40;
+        const EXT2_VOLUME_PROPERTY_MAGIC: u32 = 0x4556_504D; // 'EVPM'
+        const APP_CMD_QUERY_PROPERTY2: u32 = 0x0000_0004;
+        const DRV_LETTER_OFF: usize = 64;
+        // sizeof(EXT2_VOLUME_PROPERTY2) ≈ 132; PROPERTY3 is larger — allocate room.
+        const PROP_SIZE: usize = 256;
+
+        let handle = create_file_generic_read(open_path)?;
+        let mut buffer = vec![0u8; PROP_SIZE];
+        buffer[0..4].copy_from_slice(&EXT2_VOLUME_PROPERTY_MAGIC.to_le_bytes());
+        buffer[8..12].copy_from_slice(&APP_CMD_QUERY_PROPERTY2.to_le_bytes());
+
+        let mut bytes_returned = 0u32;
+        let ok = unsafe {
+            windows_sys::Win32::System::IO::DeviceIoControl(
+                handle,
+                IOCTL_APP_VOLUME_PROPERTY,
+                buffer.as_mut_ptr() as *mut _,
+                buffer.len() as u32,
+                buffer.as_mut_ptr() as *mut _,
+                buffer.len() as u32,
+                &mut bytes_returned,
+                std::ptr::null_mut(),
+            )
+        };
+        unsafe {
+            windows_sys::Win32::Foundation::CloseHandle(handle);
+        }
+        if ok == 0 || (bytes_returned as usize) <= DRV_LETTER_OFF {
+            return None;
+        }
+        let raw = buffer[DRV_LETTER_OFF] & 0x7F;
+        let letter = char::from(raw);
+        if letter.is_ascii_alphabetic() {
+            Some(letter.to_ascii_uppercase())
+        } else {
+            None
+        }
     }
 
     fn registry_volume_codepage(uuid: &[u8; 16]) -> Option<String> {

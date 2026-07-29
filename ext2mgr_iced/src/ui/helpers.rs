@@ -6,6 +6,10 @@ impl Ext2MgrApp {
     const TABLE_H_SCROLLBAR_PAD: f32 = 14.0;
 
     fn reload_lists(&mut self) {
+        #[cfg(windows)]
+        {
+            let _ = crate::mount::persist::scrub_partition_path_session_letters();
+        }
         let (disks, volumes, disk_rows) = crate::disk::enum_disk::enumerate_all();
         self.disks = disks;
         self.volumes = volumes;
@@ -16,7 +20,7 @@ impl Ext2MgrApp {
 
     fn reload(&mut self) -> Task<Message> {
         self.reload_lists();
-        self.automount_task()
+        Task::none()
     }
 
     /// Ext2Mgr `Ext2ProcessExt2Volumes` after load/refresh.
@@ -828,35 +832,51 @@ impl Ext2MgrApp {
 
     #[cfg(windows)]
     fn mount_volume_task(request: crate::mount::ops::MountRequest) -> Task<Message> {
+        let notify_letter = request.letter;
         Task::perform(
             async move {
                 match tokio::task::spawn_blocking(move || crate::mount::ops::mount_volume(&request)).await {
-                    Ok(Ok(message)) => (Some(message), None, false),
+                    Ok(Ok(message)) => (Some(message), None, false, true),
                     Ok(Err(err)) => {
                         let is_error = err.contains("not started");
-                        (None, Some(err), is_error)
+                        (None, Some(err), is_error, false)
                     }
-                    Err(join_err) => (None, Some(join_err.to_string()), true),
+                    Err(join_err) => (None, Some(join_err.to_string()), true, false),
                 }
             },
-            |(ok_message, err_message, is_error)| Message::PipeOpFinished {
+            move |(ok_message, err_message, is_error, notify)| Message::PipeOpFinished {
                 ok_message,
                 err_message,
                 is_error,
                 restore_mount_points: None,
+                explorer_notify: if notify {
+                    vec![(notify_letter, true)]
+                } else {
+                    Vec::new()
+                },
+                // Never auto-assign other volumes after a user-initiated mount.
+                run_automount: false,
             },
         )
     }
 
     #[cfg(windows)]
-    fn unmount_letters_task(letters: Vec<char>, symlink: String) -> Task<Message> {
+    fn unmount_letters_task(
+        letters: Vec<char>,
+        symlink: String,
+        win32_volume_name: String,
+    ) -> Task<Message> {
         Task::perform(
             async move {
                 match tokio::task::spawn_blocking(move || {
                     let mut removed = Vec::new();
                     let mut last_error = None;
                     for letter in letters {
-                        match crate::mount::ops::unmount_letter(letter, &symlink) {
+                        match crate::mount::ops::unmount_letter(
+                            letter,
+                            &symlink,
+                            &win32_volume_name,
+                        ) {
                             Ok(()) => removed.push(letter),
                             Err(err) => last_error = Some(err),
                         }
@@ -869,24 +889,31 @@ impl Ext2MgrApp {
                             .map(|letter| format!("{letter}:"))
                             .collect::<Vec<_>>()
                             .join(", ");
-                        Ok(format!("Unmounted {list}"))
+                        Ok((format!("Unmounted {list}"), removed))
                     }
                 })
                 .await
                 {
-                    Ok(Ok(message)) => (Some(message), None, false),
+                    Ok(Ok((message, removed))) => (
+                        Some(message),
+                        None,
+                        false,
+                        removed.into_iter().map(|letter| (letter, false)).collect(),
+                    ),
                     Ok(Err(err)) => {
                         let is_error = err.contains("not started");
-                        (None, Some(err), is_error)
+                        (None, Some(err), is_error, Vec::new())
                     }
-                    Err(join_err) => (None, Some(join_err.to_string()), true),
+                    Err(join_err) => (None, Some(join_err.to_string()), true, Vec::new()),
                 }
             },
-            |(ok_message, err_message, is_error)| Message::PipeOpFinished {
+            |(ok_message, err_message, is_error, explorer_notify)| Message::PipeOpFinished {
                 ok_message,
                 err_message,
                 is_error,
                 restore_mount_points: None,
+                explorer_notify,
+                run_automount: false,
             },
         )
     }
@@ -899,22 +926,48 @@ impl Ext2MgrApp {
                 self.status = "Selection has no drive letter.".to_string();
                 return Task::none();
             }
-            let symlink = if let Some(volume_index) = self.selected_volume_index() {
+            let (symlink, win32_volume_name) = if let Some(volume_index) =
+                self.selected_volume_index()
+            {
                 self.volumes
                     .get(volume_index)
-                    .map(|volume| volume.symlink.clone())
+                    .map(|volume| {
+                        (
+                            crate::mount::ops::dos_device_target(
+                                &volume.physical_object,
+                                &volume.symlink,
+                            ),
+                            volume.win32_volume_name.clone(),
+                        )
+                    })
                     .unwrap_or_default()
             } else if let Selection::Partition { disk, part } = self.selection {
                 self.disks
                     .get(disk)
                     .and_then(|entry| entry.partitions.get(part))
-                    .map(|partition| partition.symlink.clone())
+                    .map(|partition| {
+                        let linked = partition
+                            .volume_index
+                            .and_then(|index| self.volumes.get(index));
+                        let physical = linked
+                            .map(|volume| volume.physical_object.as_str())
+                            .unwrap_or("");
+                        let volume_symlink = linked
+                            .map(|volume| volume.symlink.as_str())
+                            .unwrap_or(partition.symlink.as_str());
+                        (
+                            crate::mount::ops::dos_device_target(physical, volume_symlink),
+                            linked
+                                .map(|volume| volume.win32_volume_name.clone())
+                                .unwrap_or_else(|| partition.win32_volume_name.clone()),
+                        )
+                    })
                     .unwrap_or_default()
             } else {
-                String::new()
+                (String::new(), String::new())
             };
             self.status = "Unmounting…".to_string();
-            return Self::unmount_letters_task(letters, symlink);
+            return Self::unmount_letters_task(letters, symlink, win32_volume_name);
         }
         #[cfg(not(windows))]
         {
@@ -1088,7 +1141,21 @@ impl Ext2MgrApp {
                 || Self::assignment_blocked(&existing_mountmgr_letters, replace_letter);
             let session_blocked =
                 Self::session_manager_blocked(&existing_session_letters, replace_letter);
-            let persist_mode = if mountmgr_available && !mountmgr_blocked {
+            // Prefer the *current* persistence of the letter being Changed; do not
+            // default to Mount Manager / Ext2Automount just because they are "preferred".
+            let persist_mode = if let Some(letter) = replace_letter {
+                if existing_mountmgr_letters.contains(&letter) {
+                    crate::mount::ops::MountMode::MountManager
+                } else if existing_session_letters.contains(&letter) {
+                    crate::mount::ops::MountMode::PermanentRegistry
+                } else if mount_uuid.is_some_and(|uuid| {
+                    crate::mount::persist::query_ext2_automount_letter(&uuid) == Some(letter)
+                }) {
+                    crate::mount::ops::MountMode::Ext2Automount
+                } else {
+                    crate::mount::ops::MountMode::Temporary
+                }
+            } else if mountmgr_available && !mountmgr_blocked {
                 crate::mount::ops::MountMode::MountManager
             } else if !session_blocked {
                 crate::mount::ops::MountMode::PermanentRegistry
@@ -1137,16 +1204,32 @@ impl Ext2MgrApp {
         letter: char,
         win32_volume_name: &str,
         device_nt_path: &str,
+        mount_uuid: Option<[u8; 16]>,
     ) -> String {
         let in_mountmgr = !win32_volume_name.is_empty()
-            && crate::mount::dead_letters::mountmgr_letters_for_volume(win32_volume_name).contains(&letter);
-        let in_session = crate::mount::persist::registry_letters_for_device(device_nt_path)
-            .iter()
-            .any(|entry| *entry == letter);
-        match (in_mountmgr, in_session) {
-            (true, _) => format!("{letter}:  Mount Manager"),
-            (false, true) => format!("{letter}:  Session Manager (registry)"),
-            (false, false) => format!("{letter}:  Temporary / DOS device"),
+            && crate::mount::dead_letters::mountmgr_letters_for_volume(win32_volume_name)
+                .contains(&letter);
+        // Match by letter in Session Manager first — Mount Points device_path used to be
+        // `\??\Volume{GUID}` while the registry stores `\Device\HarddiskVolumeN`, so
+        // registry_letters_for_device never matched and every SM letter looked Temporary.
+        let in_session = crate::mount::persist::registry_device_for_letter(letter).is_some_and(
+            |reg_device| {
+                device_nt_path.is_empty()
+                    || reg_device.eq_ignore_ascii_case(device_nt_path)
+                    || crate::mount::ops::query_dos_device_public(letter)
+                        .is_some_and(|live| live.eq_ignore_ascii_case(&reg_device))
+            },
+        );
+        let in_automount = !in_mountmgr
+            && !in_session
+            && mount_uuid.is_some_and(|uuid| {
+                crate::mount::persist::query_ext2_automount_letter(&uuid) == Some(letter)
+            });
+        match (in_mountmgr, in_session, in_automount) {
+            (true, _, _) => format!("{letter}:  Mount Manager"),
+            (false, true, _) => format!("{letter}:  Session Manager (registry)"),
+            (false, false, true) => format!("{letter}:  Ext2Fsd automount"),
+            (false, false, false) => format!("{letter}:  Temporary / DOS device"),
         }
     }
 
@@ -1173,6 +1256,13 @@ impl Ext2MgrApp {
                 self.status = "Choose a drive letter.".to_string();
                 return Task::none();
             };
+            if mount_symlink.is_empty() {
+                self.report_error(
+                    "Cannot assign drive letter: volume has no NT device path.\n\
+                     Refresh the list, then select the volume or partition again.",
+                );
+                return Task::none();
+            }
             if replace_letter.is_none() && !existing_mountmgr_letters.is_empty() {
                 let listed = existing_mountmgr_letters
                     .iter()
@@ -1260,7 +1350,7 @@ impl Ext2MgrApp {
                     volume_index,
                     disk_part,
                     letter,
-                    mount_win32,
+                    mount_win32.clone(),
                     mount_uuid,
                 )
             });
@@ -1269,27 +1359,55 @@ impl Ext2MgrApp {
             return Task::perform(
                 async move {
                     let result = tokio::task::spawn_blocking(move || {
+                        let mut notify = Vec::new();
                         if let Some(old_letter) = replace_letter {
-                            crate::mount::ops::unmount_letter(old_letter, &mount_symlink)?;
+                            // Session Manager in-place only: Change Temporary → Session Manager
+                            // on the *same* letter writes registry without tear-down. Changing
+                            // M: → G: must still unmount M: first.
+                            let skip_unmount = mode
+                                == crate::mount::ops::MountMode::PermanentRegistry
+                                && old_letter == letter;
+                            if !skip_unmount {
+                                crate::mount::ops::unmount_letter(
+                                    old_letter,
+                                    &mount_symlink,
+                                    &mount_win32,
+                                )?;
+                                notify.push((old_letter, false));
+                            }
                         }
-                        crate::mount::ops::mount_volume(&request)
+                        crate::mount::ops::mount_volume(&request)?;
+                        notify.push((letter, true));
+                        Ok::<Vec<(char, bool)>, String>(notify)
                     })
                     .await;
                     match result {
-                        Ok(Ok(message)) => (Some(message), None, false, restore),
+                        Ok(Ok(explorer_notify)) => (
+                            Some(format!(
+                                "Mounted {letter}: ({mode:?})"
+                            )),
+                            None,
+                            false,
+                            restore,
+                            explorer_notify,
+                        ),
                         Ok(Err(err)) => {
                             let is_error = err.contains("not started");
-                            (None, Some(err), is_error, None)
+                            (None, Some(err), is_error, None, Vec::new())
                         }
-                        Err(join_err) => (None, Some(join_err.to_string()), true, None),
+                        Err(join_err) => {
+                            (None, Some(join_err.to_string()), true, None, Vec::new())
+                        }
                     }
                 },
-                |(ok_message, err_message, is_error, restore_mount_points)| {
+                |(ok_message, err_message, is_error, restore_mount_points, explorer_notify)| {
                     Message::PipeOpFinished {
                         ok_message,
                         err_message,
                         is_error,
                         restore_mount_points,
+                        explorer_notify,
+                        run_automount: false,
                     }
                 },
             );

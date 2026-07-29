@@ -22,8 +22,8 @@ Four distinct options (do not conflate):
 | Mode | Survives reboot? | What it is |
 |------|------------------|------------|
 | Temporary | **No** | `DefineDosDevice` only (Ext2Srv, or local when elevated) |
-| Mount Manager | **Yes** | `SetVolumeMountPoint` — same mechanism Windows Disk Management uses. Needs a Win32 volume GUID. Needs Administrator. |
-| Session Manager DOS Devices | **Yes** | Registry `HKLM\...\Session Manager\DOS Devices` (`X:` → `\Device\HarddiskVolumeN`). Immediate `DefineDosDevice` bind afterward so the letter appears now — that bind is not the Temporary option. Needs Administrator. |
+| Mount Manager | **Yes** | `SetVolumeMountPoint` - same mechanism Windows Disk Management uses. Needs a Win32 volume GUID. Needs Administrator. |
+| Session Manager DOS Devices | **Yes** | Registry `HKLM\...\Session Manager\DOS Devices` (`X:` -> `\Device\HarddiskVolumeN`). Immediate `DefineDosDevice` bind afterward so the letter appears now - that bind is not the Temporary option. Needs Administrator. |
 | Ext2Fsd automount | **Config yes** | `HKLM\...\Ext2Fsd\Volumes\{UUID}` with `MountPoint=X:;`. Remounted on load/refresh. Needs EXT UUID + Administrator. |
 
 Device paths match Ext2Mgr (`Volume->Name` = `\Device\HarddiskVolumeN`). Mount Manager is disabled in the letter picker when the volume has no Win32 GUID.
@@ -33,7 +33,28 @@ Device paths match Ext2Mgr (`Volume->Name` = `\Device\HarddiskVolumeN`). Mount M
 ```bash
 cargo build --release
 cargo run
+```
+
+**Or** simply use:
+
+```
 cargo run --release
 ```
 
 From `ext2mgr_iced/`. Run **elevated** for permanent registry / Ext2Fsd Volumes / service parameter writes. Ext2Srv must be running for temporary letter ops (unless elevated local `DefineDosDevice` succeeds).
+
+### Release binaries (x64 / ARM64)
+
+From the repo root, package Ext2Srv + this GUI (user-mode only; driver stays upstream):
+
+```powershell
+.\Scripts\release_usermode.ps1
+```
+
+Default builds **this machine's architecture only**. For both arches (needs *MSVC v143 - VS 2022 C++ ARM64/ARM64EC build tools*):
+
+```powershell
+.\Scripts\release_usermode.ps1 -Platforms x64,ARM64
+```
+
+Also needs `rustup` targets for each requested arch. Output: `dist\usermode-<version>\` with per-arch zips and `RELEASE_NOTES.txt`.

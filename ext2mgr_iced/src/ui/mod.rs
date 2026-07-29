@@ -109,9 +109,7 @@ impl Ext2MgrApp {
         {
             crate::win::chrome::sync_autorun_menu(crate::win::autorun::is_autorun_enabled());
         }
-        // Ext2Mgr processes Ext2Fsd / Session Manager automounts once at startup too,
-        // not only on refresh.
-        let startup = Task::batch([app.fit_window_task(), app.automount_task()]);
+        let startup = app.fit_window_task();
         (app, startup)
     }
 

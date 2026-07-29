@@ -57,6 +57,8 @@ Original uses classic Win32 highlight colors.
 
 **Modes are not interchangeable:** Mount Manager is `SetVolumeMountPoint`. Session Manager is the registry option. Temporary is DefineDosDevice-only. Classic Session Manager also does an immediate DefineDosDevice bind after writing the key; that bind is not the Temporary option. Device path for Temporary / Session Manager is `\Device\HarddiskVolumeN`.
 
+Iced letter remove/assign extras vs classic: skip `DeleteVolumeMountPoint` unless Mount Manager owns the letter; Exact-match remove uses live `QueryDosDevice` (`\Device\…`); Session Manager Change same-letter is registry-only (no tear-down); automount order is Session Manager → `Volumes\{UUID}` → `EVP.DrvLetter`; Explorer notify via `WM_DEVICECHANGE` + `SHChangeNotify`.
+
 ### Remove Dead Letters
 
 | | Original | Iced port |
@@ -100,7 +102,7 @@ Historically Ext2Srv did: create one pipe → `ConnectNamedPipe` → hand off to
 | 1 | Ext2Srv | **Dual idle listeners** | Done — second `Ext2PipeEngine` thread in `Ext2StartPipeSrv` |
 | 2 | Ext2Srv | **Fail soft on create** | Done — create retries capped (3×50ms) instead of long sleep storms |
 | 3 | iced | **Keep-alive client** | Done — `pipe::with_shared_client` reuses one handle |
-| 4 | iced | **Off UI thread** | Partial — mount/unmount + dead-letter scan via `spawn_blocking`; still sync on UI: disk refresh/`enumerate_all`, Ext2 attr save, service start/stop, and modal `MessageBox` |
+| 4 | iced | **Off UI thread** | Partial — mount/unmount (incl. Mount Points **Remove**), dead-letter scan via `spawn_blocking`; still sync on UI: disk refresh/`enumerate_all`, Ext2 attr save, service start/stop, and modal `MessageBox` |
 | 5 | iced / policy | **Local `DefineDosDevice` when elevated** | Done — try local first when elevated, else Ext2Srv |
 | 6 | iced | **Letter assign device path = `\Device\HarddiskVolumeN`** | Done — use `physical_object` like Ext2Mgr `Volume->Name` for Temporary DefineDosDevice and Session Manager registry values |
 | 7 | iced + Ext2Srv | **Health ping** | Done — `pipe::health_check` / Refresh status uses reused connection |
