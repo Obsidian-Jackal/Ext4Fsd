@@ -284,9 +284,10 @@ Each arch folder has SHA256SUMS.txt. Example:
   Get-FileHash .\Ext2Srv.exe -Algorithm SHA256
 
 "@
-    # UTF-8 no BOM preferred for notes consumed on multiple OSes
+    # UTF-8 no BOM; normalize LF/CRLF so a CRLF-saved .ps1 does not become CRCRLF
     $utf8NoBom = New-Object System.Text.UTF8Encoding $false
-    [System.IO.File]::WriteAllText($path, $notes.Replace("`n", "`r`n"), $utf8NoBom)
+    $normalized = (($notes -replace "`r`n", "`n") -replace "`r", "`n") -replace "`n", "`r`n"
+    [System.IO.File]::WriteAllText($path, $normalized, $utf8NoBom)
     Write-Host "  wrote $path" -ForegroundColor Gray
 }
 
